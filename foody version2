@@ -135,8 +135,7 @@
         </div>
     </div>
 
-    <!-- 載入 JavaScript 邏輯 -->
-    <script type="module" src="./script.js"></script>
+    </script>
 
 </body>
 </html>
