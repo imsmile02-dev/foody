@@ -1,0 +1,687 @@
+<script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+    import { getFirestore, collection, query, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+    // --- 全域變數和初始化 ---
+    const freshForm = document.getElementById('fresh-ingredient-form');
+    const packagedForm = document.getElementById('packaged-ingredient-form');
+    const listContainer = document.getElementById('ingredient-list');
+    const emptyState = document.getElementById('empty-state');
+    const toggleButton = document.getElementById('toggle-used-visibility');
+    const modal = document.getElementById('confirmation-modal');
+    const modalMessage = document.getElementById('modal-message');
+    const modalDeleteBtn = document.getElementById('modal-delete-btn');
+    const modalCancelBtn = document.getElementById('modal-cancel-btn');
+    
+    // Firebase/Firestore 相關變數
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+    const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+    let db = null;
+    let auth = null;
+    let userId = 'loading...'; // 用於儲存當前使用者ID
+    let ingredientsData = []; // 儲存從 Firestore 載入的食材資料
+    let showUsedItems = false; // 追蹤是否顯示已使用的項目
+    let pendingDeleteId = null; // 儲存待刪除的項目 ID
+
+    /**
+     * 獲取 Firestore 公共協作集合的路徑
+     * @returns {string} 集合路徑
+     */
+    function getCollectionPath() {
+        return `artifacts/${appId}/public/data/ingredients`; 
+    }
+
+    /**
+     * 計算距離過期日期的天數，並返回狀態物件。
+     */
+    function getExpiryStatus(expiryDateString) {
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        const expiryDate = new Date(expiryDateString);
+        expiryDate.setHours(0, 0, 0, 0);
+
+        const diffTime = expiryDate.getTime() - today.getTime();
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+        let color = 'bg-secondary/10 text-secondary';
+        let warningText = `剩餘 ${diffDays} 天`;
+
+        if (diffDays < 0) {
+            color = 'bg-red-100 text-red-700 ring-2 ring-red-500';
+            warningText = `已過期 ${Math.abs(diffDays)} 天`;
+        } else if (diffDays <= 3) {
+            color = 'bg-orange-100 text-orange-700 ring-2 ring-orange-500';
+            warningText = `即將過期 (剩 ${diffDays} 天)`;
+        }
+
+        return { days: diffDays, color, warningText };
+    }
+    
+    /**
+     * 將儲存位置的 key 轉換為中文名稱
+     * @param {string} key - 位置 key ('refrigerated', 'frozen', 'room')
+     * @returns {string} 中文名稱
+     */
+    function getLocationDisplayName(key) {
+        switch (key) {
+            case 'refrigerated': return '冷藏';
+            case 'frozen': return '冷凍';
+            case 'room': return '常溫';
+            default: return '常溫';
+        }
+    }
+
+    /**
+     * 獲取位置的排序優先級: 冷凍 (1) -> 冷藏 (2) -> 常溫 (3)
+     * @param {string} key - 位置 key ('refrigerated', 'frozen', 'room')
+     * @returns {number} 排序權重
+     */
+    function getLocationPriority(locationKey) {
+        switch (locationKey) {
+            case 'frozen': return 1;
+            case 'refrigerated': return 2;
+            case 'room': return 3;
+            default: return 4; // 預設權重
+        }
+    }
+
+
+    // --- Firestore 實時監聽與資料載入 ---
+    function setupRealtimeListener() {
+        if (!db) return;
+
+        const ingredientsCol = collection(db, getCollectionPath());
+        const q = query(ingredientsCol); 
+
+        onSnapshot(q, (snapshot) => {
+            ingredientsData = snapshot.docs.map(doc => ({
+                id: doc.id,
+                ...doc.data()
+            }));
+            renderIngredients();
+        }, (error) => {
+            console.error("Error setting up real-time listener: ", error);
+            // 清除載入訊息並顯示空狀態
+            listContainer.innerHTML = '';
+            listContainer.appendChild(emptyState);
+            emptyState.style.display = 'block';
+        });
+    }
+
+    /**
+     * 建立食材物件，儲存到 Firestore 並重新渲染。
+     * @param {string} name - 食材名稱
+     * @param {string} quantity - 數量/單位
+     * @param {string} location - 儲存位置
+     * @param {string} inventoryDate - 入庫日期
+     * @param {number} storageDays - 預計可存放天數
+     * @param {string} expiryDate - 預計到期日
+     * @param {string} formId - 表單 ID
+     * @param {string} inventoryDateId - 入庫日期輸入欄位的 ID
+     */
+    async function saveNewIngredient(name, quantity, location, inventoryDate, storageDays, expiryDate, formId, inventoryDateId) {
+        if (!db) {
+            console.error("Firestore 尚未初始化。");
+            return;
+        }
+
+        const quantityStr = quantity.toString().trim();
+        
+        const newIngredient = {
+            name: name,
+            quantity: quantityStr, 
+            location: location, 
+            inventoryDate: inventoryDate, 
+            storageDays: storageDays, 
+            expiryDate: expiryDate, 
+            isUsed: false,
+            userId: userId, 
+            createdAt: new Date().toISOString(),
+        };
+
+        try {
+            await addDoc(collection(db, getCollectionPath()), newIngredient);
+
+            document.getElementById(formId).reset();
+            // 重設入庫日期為今天
+            const today = new Date().toISOString().split('T')[0];
+            document.getElementById(inventoryDateId).value = today;
+        } catch (e) {
+            console.error("Error adding document: ", e);
+        }
+    }
+
+    /**
+     * 處理庫存清單中的數量更改 (onblur 事件觸發)
+     */
+    async function handleQuantityChange(inputElement) {
+        const id = inputElement.dataset.id;
+        const newQuantity = parseFloat(inputElement.value);
+
+        if (isNaN(newQuantity) || newQuantity < 0) {
+            renderIngredients(); 
+            console.error("無效的數量輸入。數量必須是數字且大於等於 0。");
+            return;
+        }
+
+        if (!db) {
+            console.error("Firestore 尚未初始化。");
+            return;
+        }
+
+        const newIsUsed = newQuantity <= 0;
+        
+        try {
+            const docRef = doc(db, getCollectionPath(), id);
+            await updateDoc(docRef, {
+                quantity: newQuantity.toString(),
+                isUsed: newIsUsed,
+            });
+        } catch (e) {
+            console.error("Error updating document: ", e);
+        }
+    }
+    
+    // --- 刪除確認 Modal 邏輯 ---
+
+    /**
+     * 顯示自定義確認刪除彈窗
+     */
+    function showConfirmModal(id, name) {
+        pendingDeleteId = id;
+        modalMessage.textContent = `您確定要永久刪除食材「${name}」嗎？此操作不可逆！`;
+        modal.classList.remove('hidden');
+    }
+
+    /**
+     * 隱藏彈窗
+     */
+    function hideConfirmModal() {
+        modal.classList.add('hidden');
+        pendingDeleteId = null;
+    }
+
+    /**
+     * 確認刪除並執行 Firestore 刪除操作
+     */
+    async function deleteConfirmed() {
+        if (!pendingDeleteId || !db) {
+            hideConfirmModal();
+            return;
+        }
+        
+        const id = pendingDeleteId;
+        hideConfirmModal();
+
+        try {
+            const docRef = doc(db, getCollectionPath(), id);
+            await deleteDoc(docRef);
+        } catch (e) {
+            console.error("Error deleting document: ", e);
+        }
+    }
+
+    // 綁定 Modal 按鈕事件
+    modalCancelBtn.addEventListener('click', hideConfirmModal);
+    modalDeleteBtn.addEventListener('click', deleteConfirmed);
+
+
+    // --- DOM 操作和核心邏輯 ---
+
+    /**
+     * 渲染食材列表到 DOM
+     */
+    function renderIngredients() {
+        let ingredients = [...ingredientsData]; 
+        
+        // 篩選：如果 showUsedItems 為 false，則只顯示 isUsed 為 false 的項目
+        const displayIngredients = ingredients.filter(item => showUsedItems || !item.isUsed);
+
+        // --- 排序邏輯：優先依儲存位置排序，其次依到期日排序 ---
+        displayIngredients.sort((a, b) => {
+            // 1. 依儲存位置排序: 冷凍 (1) -> 冷藏 (2) -> 常溫 (3)
+            const priorityA = getLocationPriority(a.location || 'room');
+            const priorityB = getLocationPriority(b.location || 'room');
+            
+            if (priorityA !== priorityB) {
+                return priorityA - priorityB;
+            }
+            
+            // 2. 次要排序: 依到期日 (較早到期排在前面)
+            const dateA = new Date(a.expiryDate);
+            const dateB = new Date(b.expiryDate);
+            return dateA - dateB;
+        });
+
+        listContainer.innerHTML = '';
+
+        if (displayIngredients.length === 0) {
+            emptyState.textContent = showUsedItems 
+                ? '已使用的食材清單中沒有項目。' 
+                : '目前沒有任何食材需要追蹤。請新增！';
+            listContainer.appendChild(emptyState);
+            emptyState.style.display = 'block';
+            return;
+        }
+        emptyState.style.display = 'none';
+
+        displayIngredients.forEach(item => {
+            const status = getExpiryStatus(item.expiryDate);
+            const locationDisplay = getLocationDisplayName(item.location || 'room'); 
+            
+            let cardClasses = 'flex flex-col md:flex-row md:items-center md:justify-between p-4 rounded-xl shadow-md transition duration-200 hover:shadow-lg w-full';
+            
+            if (item.isUsed) {
+                cardClasses += ' bg-gray-200 opacity-60';
+            } else {
+                if (status.days < 0) {
+                    cardClasses += ' bg-red-50'; 
+                } else if (status.days <= 3) {
+                    cardClasses += ' bg-orange-50'; 
+                } else {
+                    cardClasses += ' bg-white';
+                }
+            }
+            
+            const quantityDisplayHtml = item.isUsed 
+                ? `<p class="text-sm text-gray-500">數量: ${item.quantity}</p>`
+                : `
+                    <div class="flex items-center text-sm text-gray-500">
+                        <span class="mr-1">數量:</span>
+                        <input type="number" 
+                            value="${item.quantity}" 
+                            min="0" 
+                            step="0.01"
+                            data-id="${item.id}"
+                            onblur="handleQuantityChange(this)"
+                            class="w-20 px-1 py-0.5 border border-gray-300 rounded text-center text-gray-700 font-semibold focus:border-primary focus:ring-1 focus:ring-primary">
+                    </div>
+                `;
+
+            const cardHtml = `
+                <div class="${cardClasses}" data-id="${item.id}">
+                    <!-- 左側：名稱、位置與數量 -->
+                    <div class="w-full md:w-auto md:flex-grow mr-0 md:mr-4 mb-3 md:mb-0">
+                        <p class="text-lg font-bold truncate ${item.isUsed ? 'line-through text-gray-500' : 'text-gray-800'}">${item.name}</p>
+                        <p class="text-sm font-medium text-primary/80 mb-1">儲存位置: ${locationDisplay}</p>
+                        ${quantityDisplayHtml}
+                    </div>
+                    
+                    <!-- 中央：過期資訊 -->
+                    <div class="w-full md:w-auto md:flex-shrink-0 pt-3 md:pt-0 mt-3 md:mt-0 md:mx-4 min-w-[140px] text-left md:text-right border-t border-gray-200 md:border-t-0">
+                        <p class="text-xs font-semibold text-gray-500 mb-0.5">入庫日: ${item.inventoryDate}</p>
+                        <p class="text-xs font-semibold text-gray-500 mb-1">可存放: ${item.storageDays} 日</p>
+                        <p class="text-sm font-bold text-gray-800">預計到期: ${item.expiryDate}</p>
+                        <!-- 過期提醒標籤 -->
+                        <span class="inline-block mt-1 px-2 py-0.5 text-xs font-bold rounded-full ${status.color}">
+                            ${status.warningText}
+                        </span>
+                    </div>
+
+                    <!-- 右側：管理按鈕 -->
+                    <div class="w-full flex justify-end md:w-auto md:justify-start mt-4 md:mt-0 flex-shrink-0 space-x-2">
+                        <!-- 標記為使用/未使用 切換按鈕 -->
+                        <button data-action="toggle-used" data-id="${item.id}"
+                            class="p-2 rounded-full text-white transition duration-150 shadow-md 
+                            ${item.isUsed ? 'bg-indigo-500 hover:bg-indigo-600' : 'bg-secondary hover:bg-emerald-600'}"
+                            title="${item.isUsed ? '標記為未使用 (重新上架)' : '標記為已使用 (從清單移除)'}">
+                            <!-- Lucide Icon: Check/Rotate CCW -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                ${item.isUsed ? 
+                                    '<path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/> <path d="M21 3v5h-5"/> <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/> <path d="M3 21v-5h5"/>' : 
+                                    '<path d="M20 6 9 17l-5-5"/>'
+                                }
+                            </svg>
+                        </button>
+
+                        <!-- 刪除按鈕 -->
+                        <button data-action="delete" data-id="${item.id}"
+                            class="p-2 rounded-full bg-red-500 text-white hover:bg-red-600 transition duration-150 shadow-md"
+                            title="永久刪除此項目">
+                            <!-- Lucide Icon: Trash -->
+                            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+            `;
+            listContainer.insertAdjacentHTML('beforeend', cardHtml);
+        });
+    }
+
+    /**
+     * 初始化 Firebase 應用程式和身份驗證
+     */
+    async function initializeFirebaseAndAuth() {
+        if (Object.keys(firebaseConfig).length === 0) {
+             console.error("Firebase 配置檔缺失。應用程式將無法執行資料庫操作。");
+             return;
+        }
+        
+        try {
+            const app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            setLogLevel('Debug');
+
+            // 1. 嘗試登入或匿名登入
+            if (typeof __initial_auth_token !== 'undefined') {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            } else {
+                await signInAnonymously(auth);
+            }
+        } catch (error) {
+            console.error("Firebase 初始化或身份驗證失敗:", error);
+            document.getElementById('auth-status').textContent = '登入失敗';
+            // 如果失敗，確保畫面可以進入空狀態
+            listContainer.innerHTML = '';
+            listContainer.appendChild(emptyState);
+            emptyState.style.display = 'block';
+        }
+        
+        // 2. 監聽身份狀態變更，確認使用者就緒
+        onAuthStateChanged(auth, (user) => {
+            if (user) {
+                userId = user.uid;
+                document.getElementById('user-id-display').textContent = userId;
+                document.getElementById('auth-status').textContent = '已登入 (協作啟用)';
+                // 只有在身份驗證完成後才開始監聽資料
+                setupRealtimeListener(); 
+            } else {
+                userId = crypto.randomUUID();
+                document.getElementById('user-id-display').textContent = '匿名使用者: ' + userId.substring(0, 8) + '...';
+                document.getElementById('auth-status').textContent = '匿名模式';
+            }
+        });
+    }
+
+    // --- 綁定表單提交事件 ---
+
+    // 處理生鮮食材表單提交
+    freshForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        const name = document.getElementById('fresh-name').value.trim();
+        const quantity = document.getElementById('fresh-quantity').value.trim();
+        const location = document.getElementById('fresh-location').value;
+        const inventoryDate = document.getElementById('fresh-inventoryDate').value;
+        const storageDays = parseInt(document.getElementById('fresh-storageDays').value);
+
+        if (!name || !quantity || isNaN(storageDays) || storageDays < 1) {
+            console.error("錯誤：請填寫所有必要的生鮮食材欄位並確保存放天數有效。");
+            return;
+        }
+
+        // 計算預計過期日 (入庫日期 + 存放天數)
+        const invDate = new Date(inventoryDate);
+        if (isNaN(invDate.getTime())) {
+            console.error("錯誤：無效的入庫日期。");
+            return;
+        }
+        invDate.setDate(invDate.getDate() + storageDays);
+        const expiryDate = invDate.toISOString().split('T')[0];
+
+        await saveNewIngredient(name, quantity, location, inventoryDate, storageDays, expiryDate, 'fresh-ingredient-form', 'fresh-inventoryDate');
+    });
+
+    // 處理包裝食材表單提交
+    packagedForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        
+        const name = document.getElementById('pkg-name').value.trim();
+        const quantity = document.getElementById('pkg-quantity').value.trim();
+        const location = document.getElementById('pkg-location').value;
+        const inventoryDate = document.getElementById('pkg-inventoryDate').value;
+        const expiryDate = document.getElementById('pkg-expiryDateInput').value;
+
+        if (!name || !quantity || !expiryDate || !inventoryDate) {
+            console.error("錯誤：請填寫所有必要的包裝食材欄位。");
+            return;
+        }
+
+        // 計算可存放天數 (用於儲存和顯示)
+        const invDate = new Date(inventoryDate);
+        const expDate = new Date(expiryDate);
+        
+        if (isNaN(invDate.getTime()) || isNaN(expDate.getTime())) {
+            console.error("錯誤：無效的入庫日期或有效期限。");
+            return;
+        }
+
+        const diffTime = expDate.getTime() - invDate.getTime();
+        const storageDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        
+        await saveNewIngredient(name, quantity, location, inventoryDate, storageDays, expiryDate, 'packaged-ingredient-form', 'pkg-inventoryDate');
+    });
+
+    // --- 應用程式啟動 ---
+    window.onload = () => {
+        const today = new Date().toISOString().split('T')[0];
+        
+        const inventoryDateInputs = [
+            document.getElementById('fresh-inventoryDate'),
+            document.getElementById('pkg-inventoryDate')
+        ];
+        inventoryDateInputs.forEach(input => {
+            input.value = today;
+            input.setAttribute('max', today); 
+        });
+
+        const expiryDateInput = document.getElementById('pkg-expiryDateInput');
+        if (expiryDateInput) {
+            expiryDateInput.setAttribute('min', today);
+        }
+
+        const freshStorageDaysInput = document.getElementById('fresh-storageDays');
+        if (freshStorageDaysInput) {
+            freshStorageDaysInput.setAttribute('min', 1);
+        }
+        
+        // ** (新增) 初始載入訊息 **
+        listContainer.innerHTML = '<p class="text-center text-gray-500 py-8 italic font-semibold animate-pulse">連線中... 正在載入您的雲端庫存資料。</p>';
+
+        initializeFirebaseAndAuth();
+    };
+
+    // 為了讓 onblur 事件能調用，將函數暴露給全局作用域
+    window.handleQuantityChange = handleQuantityChange; 
+    
+    // 註冊卡片按鈕點擊事件監聽器 (因為按鈕是動態生成的)
+    listContainer.addEventListener('click', async (e) => {
+        const button = e.target.closest('button');
+        if (!button) return;
+
+        const action = button.dataset.action;
+        const id = button.dataset.id;
+        const item = ingredientsData.find(i => i.id === id);
+
+        if (!id || !item || !db) return;
+
+        try {
+            const docRef = doc(db, getCollectionPath(), id);
+
+            switch (action) {
+                case 'toggle-used':
+                    await updateDoc(docRef, {
+                        isUsed: !item.isUsed,
+                        // 如果重新上架，將數量設為 1 (如果原為 0)
+                        quantity: !item.isUsed && parseFloat(item.quantity) <= 0 ? "1" : item.quantity 
+                    });
+                    break;
+                case 'delete':
+                    showConfirmModal(id, item.name);
+                    break;
+            }
+        } catch (error) {
+            console.error("處理卡片動作時發生錯誤:", error);
+        }
+    });
+
+    // ** (新增) 處理顯示/隱藏已使用項目按鈕 **
+    toggleButton.addEventListener('click', () => {
+        showUsedItems = !showUsedItems;
+        toggleButton.textContent = showUsedItems ? '隱藏已使用的項目' : '顯示已使用的項目';
+        // 更新按鈕的視覺狀態
+        if (showUsedItems) {
+            toggleButton.classList.add('bg-primary/10', 'text-primary');
+            toggleButton.classList.remove('bg-indigo-50/50', 'text-primary');
+        } else {
+            toggleButton.classList.add('bg-indigo-50/50', 'text-primary');
+            toggleButton.classList.remove('bg-primary/10', 'text-primary');
+        }
+        renderIngredients();
+    });
+</script>
+
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>食材庫存追蹤器</title>
+    <!-- 載入 Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 設定 Tailwind CSS 配置，使用 Inter 字體並啟用一些客製化 -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'Noto Sans TC', 'sans-serif'],
+                    },
+                    colors: {
+                        'primary': '#4F46E5', // Indigo-600
+                        'secondary': '#10B981', // Emerald-500
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', 'Noto Sans TC', sans-serif;
+            background-color: #f8fafc; /* Slate-50 */
+        }
+        #confirmation-modal {
+            z-index: 999;
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+
+    <div class="max-w-6xl mx-auto pb-20"> 
+        <!-- 標題與協作資訊 -->
+        <header class="mb-8 border-b pb-4">
+            <h1 class="text-4xl font-extrabold text-primary mb-2 tracking-tight">食材新鮮度追蹤 (協作版)</h1>
+            <div class="flex flex-wrap items-center text-sm text-gray-500">
+                <p class="mr-4">狀態: <span id="auth-status" class="font-semibold text-secondary">載入中...</span></p>
+                <p class="truncate">您的 ID: <code id="user-id-display" class="font-mono text-gray-700 bg-gray-100 p-1 rounded">載入中...</code></p>
+            </div>
+        </header>
+
+        <!-- 輸入表單 1: 生鮮食材 -->
+        <div class="bg-white p-6 rounded-xl shadow-lg mb-8">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4">生鮮食材</h2>
+            <form id="fresh-ingredient-form" class="grid grid-cols-1 gap-4 md:grid-cols-6">
+                <!-- 欄位略... -->
+                <div class="md:col-span-1">
+                    <label for="fresh-name" class="block text-sm font-medium text-gray-700 mb-1">食材名稱</label>
+                    <input type="text" id="fresh-name" name="name" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1">
+                    <label for="fresh-quantity" class="block text-sm font-medium text-gray-700 mb-1">數量/單位</label>
+                    <input type="text" id="fresh-quantity" name="quantity" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1">
+                    <label for="fresh-location" class="block text-sm font-medium text-gray-700 mb-1">儲存位置</label>
+                    <select id="fresh-location" name="location" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                        <option value="refrigerated">冷藏</option>
+                        <option value="frozen">冷凍</option>
+                        <option value="room">常溫</option>
+                    </select>
+                </div>
+                <div class="md:col-span-1">
+                    <label for="fresh-inventoryDate" class="block text-sm font-medium text-gray-700 mb-1">納入庫存日期</label>
+                    <input type="date" id="fresh-inventoryDate" name="inventoryDate" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1">
+                    <label for="fresh-storageDays" class="block text-sm font-medium text-gray-700 mb-1">預計可存放時間 (日)</label>
+                    <input type="number" id="fresh-storageDays" name="storageDays" required min="1" value="7" class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1 flex items-end">
+                    <button type="submit" class="w-full bg-secondary text-white font-bold py-2.5 px-4 rounded-lg hover:bg-emerald-600 transition duration-150 shadow-md hover:shadow-lg">
+                        加入清單
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- 輸入表單 2: 包裝食材 -->
+        <div class="bg-white p-6 rounded-xl shadow-lg mb-8">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4">包裝食材</h2>
+            <form id="packaged-ingredient-form" class="grid grid-cols-1 gap-4 md:grid-cols-6">
+                 <!-- 欄位略... -->
+                <div class="md:col-span-1">
+                    <label for="pkg-name" class="block text-sm font-medium text-gray-700 mb-1">食材名稱</label>
+                    <input type="text" id="pkg-name" name="name" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1">
+                    <label for="pkg-quantity" class="block text-sm font-medium text-gray-700 mb-1">數量/單位</label>
+                    <input type="text" id="pkg-quantity" name="quantity" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1">
+                    <label for="pkg-location" class="block text-sm font-medium text-gray-700 mb-1">儲存位置</label>
+                    <select id="pkg-location" name="location" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                        <option value="room">常溫</option>
+                        <option value="refrigerated">冷藏</option>
+                        <option value="frozen">冷凍</option>
+                    </select>
+                </div>
+                <div class="md:col-span-1">
+                    <label for="pkg-inventoryDate" class="block text-sm font-medium text-gray-700 mb-1">納入庫存日期</label>
+                    <input type="date" id="pkg-inventoryDate" name="inventoryDate" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1">
+                    <label for="pkg-expiryDateInput" class="block text-sm font-medium text-gray-700 mb-1">有效期限</label>
+                    <input type="date" id="pkg-expiryDateInput" name="expiryDateInput" required class="w-full p-2.5 border border-gray-300 rounded-lg focus:ring-primary focus:border-primary transition duration-150">
+                </div>
+                <div class="md:col-span-1 flex items-end">
+                    <button type="submit" class="w-full bg-secondary text-white font-bold py-2.5 px-4 rounded-lg hover:bg-emerald-600 transition duration-150 shadow-md hover:shadow-lg">
+                        加入清單
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- 食材清單顯示區 -->
+        <div class="flex justify-between items-center mb-4">
+            <h2 class="text-2xl font-semibold text-gray-800">所有食材清單</h2>
+            <button id="toggle-used-visibility" class="text-sm font-medium text-primary hover:text-indigo-700 transition duration-150 p-2 rounded-lg bg-indigo-50/50">
+                顯示已使用的項目
+            </button>
+        </div>
+        
+        <div id="ingredient-list" class="grid grid-cols-1 gap-4">
+            <p id="empty-state" class="text-center text-gray-500 py-8 italic">目前沒有任何食材。請新增！</p>
+        </div>
+
+    </div>
+    
+    <!-- 自定義刪除確認 Modal (取代 window.confirm) -->
+    <div id="confirmation-modal" class="fixed inset-0 bg-gray-600 bg-opacity-75 hidden flex items-center justify-center p-4 z-50">
+        <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm">
+            <h3 class="text-xl font-bold text-red-600 mb-3">確認刪除</h3>
+            <p class="text-gray-700 mb-6" id="modal-message">您確定要永久刪除此項目嗎？此操作不可逆！</p>
+            <div class="flex justify-end space-x-3">
+                <button id="modal-cancel-btn" class="px-4 py-2 text-gray-700 bg-gray-200 rounded-lg hover:bg-gray-300 transition duration-150 shadow-md">取消</button>
+                <button id="modal-delete-btn" class="px-4 py-2 text-white bg-red-500 rounded-lg hover:bg-red-600 transition duration-150 shadow-md">永久刪除</button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
